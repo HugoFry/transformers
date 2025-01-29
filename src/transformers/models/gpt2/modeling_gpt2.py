@@ -19,7 +19,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, Literal
 
 import torch
 import torch.utils.checkpoint
@@ -967,6 +967,140 @@ class GPT2Model(GPT2PreTrainedModel):
             cross_attentions=all_cross_attentions,
         )
 
+@dataclass
+class GPT2VisionConfig:
+    num_hidden_layers: int
+    hidden_size: int
+    num_attention_heads: int
+    dropout: float = 0.1
+    attention_dropout: float = 0.1
+    layer_norm_eps: float = 1e-12
+    image_feature: Literal['cls', 'patch', 'both'] = 'both'
+
+class VisionCrossAttention(nn.Module):
+    """
+    Cross attention module for attending from text tokens to image features.
+    Supports different attention patterns based on whether using CLS token,
+    patch tokens, or both.
+    """
+    def __init__(self, config: GPT2VisionConfig):
+        super().__init__()
+        self.config = config
+        
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size {config.hidden_size} must be divisible by num_attention_heads {config.num_attention_heads}"
+            )
+            
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.image_feature = config.image_feature
+
+        # Linear layers for Q, K, V projections
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        
+        # Output projection
+        self.output = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        # Dropouts
+        self.dropout = nn.Dropout(config.dropout)
+        self.attention_dropout = nn.Dropout(config.attention_dropout)
+
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """Reshape and transpose tensor for attention computation"""
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def compute_attention_scores(
+        self, 
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute attention scores with either softmax or sigmoid based on config"""
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+        
+        # Use sigmoid for cls token attention and softmax for patch/both
+        if self.image_feature == 'cls':
+            attention_probs = torch.sigmoid(attention_scores)
+        else:
+            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+            
+        attention_probs = self.attention_dropout(attention_probs)
+        return attention_probs
+
+    def forward(
+        self,
+        text_states: torch.Tensor,
+        image_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            text_states: (batch_size, text_seq_length, hidden_size)
+            image_states: (batch_size, image_seq_length, hidden_size)
+            attention_mask: Optional mask of shape (batch_size, num_heads, text_seq_length, image_seq_length)
+            output_attentions: Whether to return attention probabilities
+            
+        Returns:
+            output: (batch_size, text_seq_length, hidden_size)
+            attention_probs: Optional (batch_size, num_heads, text_seq_length, image_seq_length)
+        """
+        query_layer = self.transpose_for_scores(self.query(text_states))
+        key_layer = self.transpose_for_scores(self.key(image_states))
+        value_layer = self.transpose_for_scores(self.value(image_states))
+
+        attention_probs = self.compute_attention_scores(query_layer, key_layer, attention_mask)
+        context_layer = torch.matmul(attention_probs, value_layer)
+        
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape)
+        
+        output = self.output(context_layer)
+        output = self.dropout(output)
+
+        if output_attentions:
+            return output, attention_probs
+        else:
+            return output, None
+
+class GPT2VisionModel(GPT2Model):
+    def __init__(self, language_config, vision_config: GPT2VisionConfig):
+        super().__init__(language_config)
+        
+        # Create cross attention layers to be inserted between transformer blocks
+        num_cross_attentions = vision_config.num_hidden_layers // 2  # Insert after every 2 layers
+        self.cross_attention_layers = nn.ModuleList([
+            VisionCrossAttention(vision_config) 
+            for _ in range(num_cross_attentions)
+        ])
+         
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, vision_config: GPT2VisionConfig, *args, **kwargs):
+        # Let GPT2Model handle loading the model + config together
+        pretrained_model = GPT2Model.from_pretrained(pretrained_model_name_or_path)
+        
+        # Create our custom model with the SAME config object
+        model = cls(pretrained_model.config, vision_config)
+        
+        # Load the weights with strict=False
+        load_result = model.load_state_dict(pretrained_model.state_dict(), strict=False)
+        
+        # Log what wasn't loaded - this is important for debugging
+        print("Missing keys (new parameters):", load_result.missing_keys)
+        print("Unexpected keys:", load_result.unexpected_keys)
+        
+        return model
 
 @add_start_docstrings(
     """
@@ -1669,6 +1803,8 @@ __all__ = [
     "GPT2ForTokenClassification",
     "GPT2LMHeadModel",
     "GPT2Model",
+    "GPT2VisionModel",
+    "GPT2VisionConfig",
     "GPT2PreTrainedModel",
     "load_tf_weights_in_gpt2",
 ]
